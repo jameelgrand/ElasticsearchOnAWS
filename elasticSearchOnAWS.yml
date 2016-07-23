@@ -1,0 +1,238 @@
+---
+
+- hosts: localhost
+  connection: local
+  gather_facts: False
+    
+  tasks:
+
+    - name: Create a security group
+      ec2_group:
+        name: ElasticSearchNodeSecurityGroup
+        description: Elastic Search Node Security Group
+        region: "us-west-2"
+        rules:
+          - proto: tcp
+            from_port: 8080
+            to_port: 8080
+            # This should be the IP of your pc, relaxing the secutiry for the test.
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 8081
+            to_port: 8081
+            # This should be the IP of your pc, relaxing the secutiry for the test.
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 8082
+            to_port: 8082
+            # This should be the IP of your pc, relaxing the secutiry for the test.
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            # ES comms
+            from_port: 9200
+            to_port: 9200
+            # This should be the IP of other es node (still figuring out how to insert them here with ansible).
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            # ES comms
+            from_port: 9300
+            to_port: 9300
+            # This should be the IP of other es node (still figuring out how to insert them here with ansible).
+            # Relaxing
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            # This should be the IP of your pc, relaxing the secutiry for the test.
+            cidr_ip: 0.0.0.0/0
+          - proto: icmp
+            from_port: -1 # icmp type, -1 = any type
+            to_port:  -1 # icmp subtype, -1 = any subtype
+            # This should be the IP of your pc, relaxing the secutiry for the test.
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+          - proto: icmp
+            from_port: -1 # icmp type, -1 = any type
+            to_port:  -1 # icmp subtype, -1 = any subtype
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            # ES comms
+            from_port: 9200
+            to_port: 9200
+            # This should be the IP of other es node (still figuring out how to insert them here with ansible).
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            # ES comms
+            from_port: 9300
+            to_port: 9300
+            # This should be the IP of other es node (still figuring out how to insert them here with ansible).
+            # Relaxing
+            cidr_ip: 0.0.0.0/0
+        
+    
+    - name: Provision a set of instances in the ElasticSearchNodeSecurityGroup
+      ec2:
+         region: "us-west-2"
+         key_name: devenv-key
+         group: ElasticSearchNodeSecurityGroup
+         instance_type: t2.micro
+         image: "ami-7172b611" #aws-linux
+         #image: "ami-775e4f16" #rhel
+         wait: true
+         count: 3 #Always create new 3 nodes, as opposed to exact count.
+         count_tag:
+            Name: ElasticSearchNode
+         instance_tags:
+            Name: ElasticSearchNode
+      register: ec2
+    - name: Add all instance public IPs to host group
+      add_host: hostname={{ item.public_ip }} groupname=launched
+      with_items: ec2.instances     
+
+    - name: Wait for SSH to come up
+      wait_for: host={{ item.public_dns_name }} port=22 delay=60 timeout=320 state=started
+      with_items: ec2.instances
+      
+
+- hosts: launched
+  name:     
+  sudo: true
+  user: ec2-user
+  gather_facts: true
+   
+  tasks:
+       
+     - debug: msg={{ item }}
+       with_items: "{{ groups['launched'] }}"
+  
+     - name: Import a key from a url
+       rpm_key: state=present validate_certs=False key=https://packages.elastic.co/GPG-KEY-elasticsearch
+      
+     - name: insert/update "Match User" configuation block in /etc/yum.repos.d/elasticsearch.repo
+       blockinfile:
+            dest: /etc/yum.repos.d/elasticsearch.repo
+            create: yes
+            block: |
+                [elasticsearch-2.x]
+                name=Elasticsearch repository for 2.x packages
+                baseurl=https://packages.elastic.co/elasticsearch/2.x/centos
+                gpgcheck=1
+                gpgkey=https://packages.elastic.co/GPG-KEY-elasticsearch
+                enabled=1
+
+     - name: Installs elasticsearch 
+       yum: name=elasticsearch state=latest
+
+     - name: Installs nginx
+       yum: name=nginx state=latest
+
+       
+     - name: Enables elasticseatch
+       service: name=elasticsearch enabled=yes
+     
+     - name: Enables nginx
+       service: name=nginx enabled=yes
+     
+     - name: Update elasticsearch config (clustering)
+       # I've hit this bug here: https://github.com/ansible/ansible/issues/1341
+       lineinfile: dest=/etc/elasticsearch/elasticsearch.yml regexp='discovery.zen.ping.unicast.hosts:' line="discovery.zen.ping.unicast.hosts{{':'}} ['{{ item }}','{{ item }}','{{ item }}']"
+       with_items: "{{ groups['launched'] }}"
+       
+     - name: Install kopf plugin
+       shell: /usr/share/elasticsearch/bin/plugin install lmenezes/elasticsearch-kopf
+       
+     - name: Configure proxy on nginx
+       blockinfile:
+            # dirty hack, bad practice to write directly into nginx.conf.
+            #dest: /etc/nginx/conf.d/elasticproxy.conf
+            dest: /etc/nginx/nginx.conf
+            create: yes
+            block: |
+                events {
+                  worker_connections  1024;
+                }
+
+                http {
+
+                  upstream elasticsearch {
+                      server 127.0.0.1:9200;
+                  }
+
+                  # Allow HEAD / for all
+                  #
+                  server {
+                      listen 8080;
+
+                      location / {
+                        return 401;
+                      }
+
+                      location = / {
+                        if ($request_method !~ "HEAD") {
+                          return 403;
+                          break;
+                        }
+
+                       
+                        proxy_pass http://elasticsearch;
+                        proxy_redirect off;
+                      }
+                  }
+
+                  # Allow access to /_search and /_analyze for authenticated "users"
+                  #
+                  server {
+                      listen 8081;
+
+                      auth_basic           "Elasticsearch Users";
+                      auth_basic_user_file /etc/es-users;
+
+                      location / {
+                        return 403;
+                      }
+
+                      location ~* ^(/_search|/_analyze) {
+                        proxy_pass http://elasticsearch;
+                        proxy_redirect off;
+                      }
+                  }
+
+                  # Allow access to anything for authenticated "admins"
+                  #
+                  server {
+                      listen 8082;
+
+                      auth_basic           "Elasticsearch Admins";
+                      auth_basic_user_file /etc/es-admins;
+
+                      location / {
+                        proxy_pass http://elasticsearch;
+                        proxy_redirect off;
+                      }
+                  }
+
+                }
+    
+     - name: Create passwords for users and admins to protect kopf web interface
+       shell: printf "user:$(openssl passwd -crypt user)"   > /etc/es-users
+       
+     - name: Create passwords for users and admins to protect kopf web interface
+       shell: printf "admin:$(openssl passwd -crypt admin)" > /etc/es-admins
+
+     - name: Start elasticsearch service
+       service: name=elasticsearch state=started
+
+     - name: Start nginx reverse proxy service
+       service: name=nginx state=started
